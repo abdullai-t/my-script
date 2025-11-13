@@ -32,7 +32,7 @@ Enter your email for Let's Encrypt notifications: admin@yourdomain.com
 
 ---
 
-## Step 5: Test Installation
+## Step 3: Test Installation
 
 ```bash
 ssl-manager --help
@@ -47,7 +47,7 @@ Usage: ssl-manager.sh [command] [domain] [options]
 
 ---
 
-## Step 6: Issue Your First Certificate
+## Step 4: Issue Your First Certificate
 
 ```bash
 # Test first (dry-run, no real certificate)
@@ -66,7 +66,7 @@ ssl-manager issue yourdomain.com
 
 ---
 
-## Step 7: Issue Certificates for All Domains
+## Step 5: Issue Certificates for All Domains
 
 ```bash
 ssl-manager issue www.yourdomain.com
@@ -90,8 +90,12 @@ sudo /opt/bitnami/ctlscript.sh start apache
 ```
 
 ---
+### Note: Make sure to restart Apache after running issue/renew commands 
+```bash
+sudo /opt/bitnami/ctlscript.sh restart
+```
 
-## Step 8: Verify Certificates
+## Step 6: Verify Certificates
 
 ```bash
 # List all certificates
@@ -115,7 +119,7 @@ curl -I https://yourdomain.com
 
 ---
 
-## Step 9: Configure WordPress (Optional)
+## Step 7: Configure WordPress (Optional)
 
 Edit WordPress config:
 ```bash
@@ -173,6 +177,7 @@ ssl-manager test domain.com
 ```
 
 ---
+
 
 ## 🔧 Troubleshooting
 
@@ -363,3 +368,6 @@ Your SSL certificates are now:
 **Maintenance required: Zero** (fully automated)
 
 Visit your site: `https://yourdomain.com` 🔒
+
+
+wEeUVzv@G77=
