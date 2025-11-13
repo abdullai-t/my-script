@@ -32,6 +32,7 @@ SKIP_DNS_CHECK=false
 SKIP_WEBROOT_CHECK=false
 AUTO_APACHE_RESTART=true
 APACHE_CTL="/opt/bitnami/ctlscript.sh"
+APACHE_VHOSTS_DIR="/opt/bitnami/apache2/conf/vhosts"
 
 # Colors for output
 RED='\033[0;31m'
@@ -363,6 +364,95 @@ untrack_domain() {
     fi
 }
 
+create_ssl_vhost() {
+    local domain=$1
+    local vhost_file="${APACHE_VHOSTS_DIR}/${domain}-ssl.conf"
+    
+    log INFO "Creating SSL VirtualHost configuration for $domain..."
+    
+    # Create vhosts directory if it doesn't exist
+    if [ ! -d "$APACHE_VHOSTS_DIR" ]; then
+        mkdir -p "$APACHE_VHOSTS_DIR"
+    fi
+    
+    # Create the SSL VirtualHost configuration
+    cat > "$vhost_file" <<EOF
+<VirtualHost *:443>
+  ServerName ${domain}
+  DocumentRoot "/opt/bitnami/wordpress"
+
+  SSLEngine on
+  SSLCertificateFile "/bitnami/wordpress/wp-content/certbot/config/live/${domain}/cert.pem"
+  SSLCertificateKeyFile "/bitnami/wordpress/wp-content/certbot/config/live/${domain}/privkey.pem"
+  SSLCertificateChainFile "/bitnami/wordpress/wp-content/certbot/config/live/${domain}/chain.pem"
+
+  # Force HTTPS redirect
+  RewriteEngine On
+  RewriteCond %{HTTPS} !=on
+  RewriteRule ^/(.*) https://%{SERVER_NAME}/\$1 [R,L]
+
+  <Directory "/opt/bitnami/wordpress">
+    Options -Indexes +FollowSymLinks -MultiViews
+    AllowOverride All
+    Require all granted
+    
+    # WordPress Multisite rules
+    RewriteEngine On
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+    RewriteBase /
+    RewriteRule ^index\.php\$ - [L]
+    
+    # add a trailing slash to /wp-admin
+    RewriteRule ^wp-admin\$ wp-admin/ [R=301,L]
+    
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+    RewriteRule ^(wp-(content|admin|includes).*) \$1 [L]
+    RewriteRule ^(.*\.php)\$ \$1 [L]
+    RewriteRule . index.php [L]
+  </Directory>
+  
+  # Security headers
+  Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  Header always set X-Frame-Options "SAMEORIGIN"
+  Header always set X-Content-Type-Options "nosniff"
+  
+  # Logs
+  ErrorLog "/opt/bitnami/apache2/logs/${domain}-error.log"
+  CustomLog "/opt/bitnami/apache2/logs/${domain}-access.log" combined
+</VirtualHost>
+EOF
+
+    if [ $? -eq 0 ]; then
+        log SUCCESS "SSL VirtualHost configuration created: $vhost_file"
+        
+        # Test Apache configuration
+        /opt/bitnami/apache2/bin/apachectl configtest >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            log SUCCESS "Apache configuration test passed"
+            return 0
+        else
+            log WARN "Apache configuration test failed, but config file was created"
+            return 1
+        fi
+    else
+        log ERROR "Failed to create SSL VirtualHost configuration"
+        return 1
+    fi
+}
+
+remove_ssl_vhost() {
+    local domain=$1
+    local vhost_file="${APACHE_VHOSTS_DIR}/${domain}-ssl.conf"
+    
+    if [ -f "$vhost_file" ]; then
+        log INFO "Removing SSL VirtualHost configuration for $domain..."
+        rm -f "$vhost_file"
+        log SUCCESS "SSL VirtualHost configuration removed"
+    fi
+}
+
 # ============================================================================
 # Certificate Operations
 # ============================================================================
@@ -431,6 +521,10 @@ issue_certificate() {
         local cert_path="${CONFIG_DIR}/live/${domain}"
         
         track_domain "$domain"
+        
+        # Create SSL VirtualHost configuration
+        create_ssl_vhost "$domain"
+        
         log SUCCESS "Certificate issued successfully for $domain"
         log INFO "Certificate expires: $expiry"
         log INFO "Certificate path: $cert_path"
@@ -475,6 +569,9 @@ renew_certificate() {
     cmd="$cmd --logs-dir $LOGS_DIR"
     cmd="$cmd --non-interactive"
     
+    # Force renewal if certificate is valid but user wants to renew
+    cmd="$cmd --force-renewal"
+    
     if [ "$DRY_RUN" = true ]; then
         cmd="$cmd --dry-run"
         log INFO "Running in dry-run mode"
@@ -492,6 +589,9 @@ renew_certificate() {
     if [ $exit_code -eq 0 ]; then
         local expiry=$(get_cert_expiry "$domain")
         local cert_path="${CONFIG_DIR}/live/${domain}"
+        
+        # Update SSL VirtualHost configuration in case cert paths changed
+        create_ssl_vhost "$domain"
         
         log SUCCESS "Certificate renewed successfully for $domain"
         log INFO "New expiry: $expiry"
@@ -599,6 +699,10 @@ revoke_certificate() {
     
     if [ $exit_code -eq 0 ]; then
         untrack_domain "$domain"
+        
+        # Remove SSL VirtualHost configuration
+        remove_ssl_vhost "$domain"
+        
         log SUCCESS "Certificate revoked successfully for $domain"
         
         if [ "$JSON_OUTPUT" = true ]; then
@@ -721,10 +825,10 @@ SSL Manager - Certificate Management Script
 Usage: $(basename $0) [command] [domain] [options]
 
 Commands:
-  issue <domain>       Issue a new certificate
+  issue <domain>       Issue a new certificate and create SSL VirtualHost
   renew <domain>       Renew an existing certificate
   renew-all            Renew all certificates expiring within $RENEWAL_DAYS days
-  revoke <domain>      Revoke a certificate
+  revoke <domain>      Revoke a certificate and remove SSL VirtualHost
   list                 List all managed certificates
   status <domain>      Show certificate status
   test <domain>        Test certificate issuance (dry-run)
@@ -739,6 +843,13 @@ Options:
   --no-restart         Don't auto-restart Apache
   --help               Show this help message
 
+Features:
+  - Automatically stops/starts Apache in standalone mode
+  - Creates SSL VirtualHost config at: ${APACHE_VHOSTS_DIR}/{domain}-ssl.conf
+  - Includes WordPress Multisite rewrite rules
+  - Adds security headers (HSTS, X-Frame-Options, etc.)
+  - Force-renews certificates even if not due
+
 Examples:
   $(basename $0) issue example.com
   $(basename $0) issue example.com --standalone
@@ -749,6 +860,7 @@ Examples:
 Configuration: $CONFIG_FILE
 Logs: $LOG_FILE
 Challenge Method: $CHALLENGE_METHOD
+VirtualHosts Dir: $APACHE_VHOSTS_DIR
 EOF
 }
 
