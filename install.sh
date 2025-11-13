@@ -128,6 +128,39 @@ ln -s "$INSTALL_DIR/ssl-manager.sh" /usr/local/bin/ssl-manager
 
 echo -e "${GREEN}✓ Symlink created${NC}"
 
+# Add alias to bashrc for bitnami user
+echo -e "${BLUE}Adding command alias for bitnami user...${NC}"
+
+BITNAMI_BASHRC="/home/bitnami/.bashrc"
+
+if [ -f "$BITNAMI_BASHRC" ]; then
+    # Check if alias already exists
+    if ! grep -q "alias ssl-manager=" "$BITNAMI_BASHRC"; then
+        echo "" >> "$BITNAMI_BASHRC"
+        echo "# SSL Manager alias" >> "$BITNAMI_BASHRC"
+        echo 'alias ssl-manager="sudo /opt/ssl-manager/ssl-manager.sh"' >> "$BITNAMI_BASHRC"
+        echo -e "${GREEN}✓ Alias added to bitnami user bashrc${NC}"
+    else
+        echo -e "${GREEN}✓ Alias already exists in bashrc${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠ Bitnami user bashrc not found, skipping alias${NC}"
+fi
+
+# Add alias to root bashrc as well
+ROOT_BASHRC="/root/.bashrc"
+
+if [ -f "$ROOT_BASHRC" ]; then
+    if ! grep -q "alias ssl-manager=" "$ROOT_BASHRC"; then
+        echo "" >> "$ROOT_BASHRC"
+        echo "# SSL Manager alias" >> "$ROOT_BASHRC"
+        echo 'alias ssl-manager="sudo /opt/ssl-manager/ssl-manager.sh"' >> "$ROOT_BASHRC"
+        echo -e "${GREEN}✓ Alias added to root bashrc${NC}"
+    fi
+fi
+
+echo -e "${GREEN}✓ Command alias configured${NC}"
+
 # Configure sudo access
 echo -e "${BLUE}Configuring sudo access...${NC}"
 
@@ -237,6 +270,47 @@ chmod 755 "$INSTALL_DIR/test.sh"
 
 echo -e "${GREEN}✓ Test script created${NC}"
 
+# Configure Apache SSL configuration
+echo -e "${BLUE}Configuring Apache SSL settings...${NC}"
+
+BITNAMI_SSL_CONF="/opt/bitnami/apache2/conf/bitnami/bitnami-ssl.conf"
+
+# Backup original bitnami-ssl.conf if it exists
+if [ -f "$BITNAMI_SSL_CONF" ]; then
+    cp "$BITNAMI_SSL_CONF" "$BITNAMI_SSL_CONF.backup.$(date +%Y%m%d_%H%M%S)"
+    echo -e "${GREEN}✓ Backed up original bitnami-ssl.conf${NC}"
+fi
+
+# Create new bitnami-ssl.conf optimized for SSL Manager
+cat > "$BITNAMI_SSL_CONF" <<'EOF'
+# Default SSL Virtual Host configuration.
+
+<IfModule !ssl_module>
+  LoadModule ssl_module modules/mod_ssl.so
+</IfModule>
+
+Listen 443
+SSLProtocol all -SSLv2 -SSLv3
+SSLHonorCipherOrder on
+SSLCipherSuite "EECDH+ECDSA+AESGCM EECDH+aRSA+AESGCM EECDH+ECDSA+SHA384 EECDH+ECDSA+SHA256 EECDH+aRSA+SHA384 EECDH+aRSA+SHA256 EECDH !aNULL !eNULL !LOW !3DES !MD5 !EXP !PSK !SRP !DSS !EDH !RC4"
+SSLPassPhraseDialog  builtin
+SSLSessionCache "shmcb:/opt/bitnami/apache/logs/ssl_scache(512000)"
+SSLSessionCacheTimeout  300
+
+
+IncludeOptional /opt/bitnami/apache2/conf/vhosts/*.conf
+EOF
+
+echo -e "${GREEN}✓ Apache SSL configuration updated${NC}"
+
+# Test Apache configuration
+if /opt/bitnami/apache2/bin/apachectl configtest >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Apache configuration test passed${NC}"
+else
+    echo -e "${YELLOW}⚠ Apache configuration test failed, but continuing...${NC}"
+    echo -e "${YELLOW}  You may need to manually check the Apache configuration${NC}"
+fi
+
 # Installation complete
 echo ""
 echo -e "${GREEN}============================================${NC}"
@@ -275,4 +349,9 @@ echo -e "${YELLOW}Important:${NC}"
 echo "  - Make sure your domain DNS points to this server"
 echo "  - Port 80 must be accessible for webroot validation"
 echo "  - Run 'ssl-manager test <domain>' before issuing real certificates"
+echo ""
+echo -e "${BLUE}Next Steps:${NC}"
+echo "  1. Logout and login again, OR run: source ~/.bashrc"
+echo "  2. Test command: ssl-manager --help"
+echo "  3. Issue certificate: ssl-manager issue yourdomain.com"
 echo ""
