@@ -367,6 +367,8 @@ untrack_domain() {
 create_ssl_vhost() {
     local domain=$1
     local vhost_file="${APACHE_VHOSTS_DIR}/${domain}-ssl.conf"
+    local ssl_conf="/opt/bitnami/apache2/conf/bitnami/bitnami-ssl.conf"
+    local include_line="IncludeOptional /opt/bitnami/apache2/conf/vhosts/${domain}-ssl.conf"
     
     log INFO "Creating SSL VirtualHost configuration for $domain..."
     
@@ -427,6 +429,21 @@ EOF
     if [ $? -eq 0 ]; then
         log SUCCESS "SSL VirtualHost configuration created: $vhost_file"
         
+        # Add Include directive to bitnami-ssl.conf if not already present
+        if [ -f "$ssl_conf" ]; then
+            if ! grep -q "$include_line" "$ssl_conf"; then
+                log INFO "Adding Include directive to bitnami-ssl.conf..."
+                echo "" >> "$ssl_conf"
+                echo "# SSL VirtualHost for ${domain}" >> "$ssl_conf"
+                echo "$include_line" >> "$ssl_conf"
+                log SUCCESS "Include directive added to bitnami-ssl.conf"
+            else
+                log INFO "Include directive already exists in bitnami-ssl.conf"
+            fi
+        else
+            log WARN "bitnami-ssl.conf not found at $ssl_conf"
+        fi
+        
         # Test Apache configuration
         /opt/bitnami/apache2/bin/apachectl configtest >/dev/null 2>&1
         if [ $? -eq 0 ]; then
@@ -445,11 +462,24 @@ EOF
 remove_ssl_vhost() {
     local domain=$1
     local vhost_file="${APACHE_VHOSTS_DIR}/${domain}-ssl.conf"
+    local ssl_conf="/opt/bitnami/apache2/conf/bitnami/bitnami-ssl.conf"
+    local include_line="IncludeOptional /opt/bitnami/apache2/conf/vhosts/${domain}-ssl.conf"
     
     if [ -f "$vhost_file" ]; then
         log INFO "Removing SSL VirtualHost configuration for $domain..."
         rm -f "$vhost_file"
         log SUCCESS "SSL VirtualHost configuration removed"
+    fi
+    
+    # Remove Include directive from bitnami-ssl.conf
+    if [ -f "$ssl_conf" ]; then
+        if grep -q "$include_line" "$ssl_conf"; then
+            log INFO "Removing Include directive from bitnami-ssl.conf..."
+            # Remove the include line and the comment line before it
+            sed -i "/# SSL VirtualHost for ${domain}/d" "$ssl_conf"
+            sed -i "\|$include_line|d" "$ssl_conf"
+            log SUCCESS "Include directive removed from bitnami-ssl.conf"
+        fi
     fi
 }
 
