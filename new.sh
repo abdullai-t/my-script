@@ -1,265 +1,278 @@
 #!/bin/bash
 #
-# SSL Manager - Automated Certificate Management for Bitnami Multisite
-# Supports issue, renew, revoke, and auto Apache configuration linking
+# SSL Manager Installation Script
+# This script sets up the SSL Manager on Bitnami Lightsail
 #
 
 set -e
 
-# ============================================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "${BLUE}============================================${NC}"
+echo -e "${BLUE}  SSL Manager Installation for Lightsail${NC}"
+echo -e "${BLUE}============================================${NC}"
+echo ""
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run as root or with sudo${NC}"
+    exit 1
+fi
+
 # Configuration
-# ============================================================================
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/config/settings.conf"
-LOG_FILE="${SCRIPT_DIR}/logs/ssl-manager.log"
-LOCK_FILE="${SCRIPT_DIR}/ssl-manager.lock"
-DOMAINS_FILE="${SCRIPT_DIR}/certs/domains.list"
-
+INSTALL_DIR="/opt/ssl-manager"
 WEBROOT="/bitnami/wordpress"
-CONFIG_DIR="/bitnami/wordpress/wp-content/certbot/config"
-WORK_DIR="/bitnami/wordpress/wp-content/certbot/work"
-LOGS_DIR="/bitnami/wordpress/wp-content/certbot/logs"
+WEB_USER="daemon"
+
+# Detect email
+echo -e "${YELLOW}Configuration${NC}"
+read -p "Enter your email for Let's Encrypt notifications: " LETSENCRYPT_EMAIL
+
+if [ -z "$LETSENCRYPT_EMAIL" ]; then
+    echo -e "${RED}Email is required${NC}"
+    exit 1
+fi
+
+# Verify email format
+if [[ ! "$LETSENCRYPT_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    echo -e "${RED}Invalid email format${NC}"
+    exit 1
+fi
+
+echo ""
+echo -e "${BLUE}Creating directories...${NC}"
+
+# Create directory structure
+mkdir -p "$INSTALL_DIR"/{config,lib,logs,certs}
+mkdir -p "$WEBROOT/wp-content/certbot"/{config,work,logs}
+mkdir -p "$WEBROOT/.well-known/acme-challenge"
+
+echo -e "${GREEN}✓ Directories created${NC}"
+
+# Create configuration file
+echo -e "${BLUE}Creating configuration file...${NC}"
+
+cat > "$INSTALL_DIR/config/settings.conf" <<EOF
+# SSL Manager Configuration
+
+# Paths
+WEBROOT="$WEBROOT"
+CONFIG_DIR="$WEBROOT/wp-content/certbot/config"
+WORK_DIR="$WEBROOT/wp-content/certbot/work"
+LOGS_DIR="$WEBROOT/wp-content/certbot/logs"
 CERTBOT_PATH="/usr/bin/certbot"
-APACHE_CONF_DIR="/opt/bitnami/apache2/conf/vhosts"
-MAIN_SSL_CONF="/opt/bitnami/apache2/conf/bitnami/bitnami-ssl.conf"
-APACHE_BIN="/opt/bitnami/ctlscript.sh"
-LETSENCRYPT_EMAIL="admin@example.com"
+
+# Let's Encrypt Configuration
+LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL"
+
+# Challenge method: webroot, standalone, or dns
 CHALLENGE_METHOD="standalone"
+
+# Auto-renewal: renew certificates within N days of expiry
 RENEWAL_DAYS=30
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
+# Logging
+LOG_FILE="$INSTALL_DIR/logs/ssl-manager.log"
+LOG_LEVEL="INFO"
 
-log() {
-  local level=$1; shift
-  local message="$@"
-  local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-  echo "[${timestamp}] [${level}] ${message}" >> "$LOG_FILE"
-  echo "[${level}] ${message}"
-}
-
-error_exit() {
-  log ERROR "$1"
-  cleanup
-  exit 1
-}
-
-cleanup() {
-  [ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
-}
-
-acquire_lock() {
-  if [ -f "$LOCK_FILE" ]; then
-    local lock_pid=$(cat "$LOCK_FILE")
-    # Corrected syntax for 'if' statement execution
-    if ps -p "$lock_pid" > /dev/null 2>&1; then
-      error_exit "Another instance running (PID: $lock_pid)"
-    fi
-    rm -f "$LOCK_FILE"
-  fi
-  echo $$ > "$LOCK_FILE"
-}
-
-validate_domain() {
-  local domain=$1
-  if [[ ! "$domain" =~ ^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}$ ]]; then
-    error_exit "Invalid domain: $domain"
-  fi
-}
-
-create_directories() {
-  mkdir -p "$CONFIG_DIR" "$WORK_DIR" "$LOGS_DIR"
-  mkdir -p "$WEBROOT/.well-known/acme-challenge"
-  mkdir -p "$APACHE_CONF_DIR"
-  mkdir -p "$(dirname "$LOG_FILE")"
-}
-
-get_cert_expiry() {
-  local domain=$1
-  local cert_file="${CONFIG_DIR}/live/${domain}/cert.pem"
-  [ -f "$cert_file" ] && openssl x509 -enddate -noout -in "$cert_file" | cut -d= -f2
-}
-
-days_until_expiry() {
-  local domain=$1
-  local expiry=$(get_cert_expiry "$domain")
-  [ -z "$expiry" ] && echo 999 && return
-  local expiry_epoch=$(date -d "$expiry" +%s)
-  local now_epoch=$(date +%s)
-  echo $(( (expiry_epoch - now_epoch) / 86400 ))
-}
-
-track_domain() {
-  local domain=$1
-  touch "$DOMAINS_FILE"
-  grep -qx "$domain" "$DOMAINS_FILE" || echo "$domain" >> "$DOMAINS_FILE"
-}
-
-untrack_domain() {
-  local domain=$1
-  [ -f "$DOMAINS_FILE" ] && sed -i "/^${domain}$/d" "$DOMAINS_FILE"
-}
-
-link_certificate_to_apache() {
-  local domain=$1
-  local conf_file="${APACHE_CONF_DIR}/${domain}-ssl.conf"
-  local cert_path="${CONFIG_DIR}/live/${domain}"
-  local wp_root="/bitnami/wordpress" # Define correct webroot path
-
-  log INFO "Linking certificate for $domain to Apache..."
-
-  cat > "$conf_file" <<EOF
-<VirtualHost *:443>
-  ServerName $domain
-  DocumentRoot "$wp_root"
-  SSLEngine on
-  SSLCertificateFile "$cert_path/cert.pem"
-  SSLCertificateKeyFile "$cert_path/privkey.pem"
-  SSLCertificateChainFile "$cert_path/chain.pem"
-  
-  # === CRITICAL FIX for Certbot 404 (Multisite Configuration) ===
-  # This Alias ensures ACME challenge requests bypass WordPress/Multisite routing.
-  Alias /.well-known/acme-challenge "$wp_root/.well-known/acme-challenge"
-  <Directory "$wp_root/.well-known/acme-challenge">
-    Options None
-    AllowOverride None
-    Require all granted
-  </Directory>
-  # =============================================================
-  
-  <Directory "$wp_root">
-    AllowOverride All
-    Require all granted
-  </Directory>
-</VirtualHost>
+# Safety Options
+DRY_RUN=false
+BACKUP_CERTS=true
 EOF
 
-  log INFO "SSL vhost created: $conf_file"
+echo -e "${GREEN}✓ Configuration file created${NC}"
 
-  if ! grep -q "$conf_file" "$MAIN_SSL_CONF"; then
-    echo "Include \"$conf_file\"" >> "$MAIN_SSL_CONF"
-  fi
+# Set proper permissions
+echo -e "${BLUE}Setting permissions...${NC}"
 
-  "$APACHE_BIN" reload apache
-  log INFO "Apache reloaded"
-}
+chown -R root:root "$INSTALL_DIR"
+chmod 750 "$INSTALL_DIR"
+chmod 640 "$INSTALL_DIR/config/settings.conf"
+chmod 755 "$INSTALL_DIR/logs"
+chmod 755 "$INSTALL_DIR/certs"
 
-remove_apache_link() {
-  local domain=$1
-  local conf_file="${APACHE_CONF_DIR}/${domain}-ssl.conf"
-  if [ -f "$conf_file" ]; then
-    rm -f "$conf_file"
-    log INFO "Removed Apache vhost for $domain"
-    sed -i "\|$conf_file|d" "$MAIN_SSL_CONF"
-    "$APACHE_BIN" reload apache
-  fi
-}
+chown -R $WEB_USER:$WEB_USER "$WEBROOT/wp-content/certbot"
+chmod -R 755 "$WEBROOT/wp-content/certbot"
 
-# ============================================================================
-# Certificate Operations
-# ============================================================================
+chown -R $WEB_USER:$WEB_USER "$WEBROOT/.well-known"
+chmod -R 755 "$WEBROOT/.well-known"
 
-issue_certificate() {
-  local domain=$1
-  validate_domain "$domain"
-  create_directories
-  log INFO "Issuing certificate for $domain"
+echo -e "${GREEN}✓ Permissions set${NC}"
 
-  # Check if a specific certbot binary path is required, otherwise use the configured CERTBOT_PATH
-  local certbot_cmd="$CERTBOT_PATH"
-  if [ ! -x "$CERTBOT_PATH" ] && [ -x "/opt/bitnami/letsencrypt/bin/certbot" ]; then
-    certbot_cmd="/opt/bitnami/letsencrypt/bin/certbot"
-  fi
+# Install main script
+echo -e "${BLUE}Installing main script...${NC}"
 
+# Download the main script from GitHub
+if wget -q https://raw.githubusercontent.com/abdullai-t/my-script/main/ssl-manager.sh -O "$INSTALL_DIR/ssl-manager.sh"; then
+    chmod 750 "$INSTALL_DIR/ssl-manager.sh"
+    echo -e "${GREEN}✓ Main script downloaded and installed${NC}"
+else
+    echo -e "${RED}✗ Failed to download main script${NC}"
+    echo -e "${YELLOW}Please manually download ssl-manager.sh to $INSTALL_DIR/${NC}"
+    echo -e "${YELLOW}wget https://raw.githubusercontent.com/abdullai-t/my-script/main/ssl-manager.sh -O $INSTALL_DIR/ssl-manager.sh${NC}"
+    echo -e "${YELLOW}Then run: chmod 750 $INSTALL_DIR/ssl-manager.sh${NC}"
+fi
 
-  "$certbot_cmd" certonly --webroot -w "$WEBROOT" -d "$domain" \
-    --email "$LETSENCRYPT_EMAIL" --agree-tos --non-interactive \
-    --config-dir "$CONFIG_DIR" --work-dir "$WORK_DIR" --logs-dir "$LOGS_DIR"
+# Create symlink
+echo -e "${BLUE}Creating command symlink...${NC}"
 
-  # Check if Certbot was successful
-  if [ $? -eq 0 ]; then
-    track_domain "$domain"
-    link_certificate_to_apache "$domain"
-    log INFO "Certificate issued and configured for $domain"
-  else
-    log ERROR "Certbot failed to issue certificate for $domain. Check logs."
-    return 1
-  fi
-}
+if [ -L /usr/local/bin/ssl-manager ]; then
+    rm /usr/local/bin/ssl-manager
+fi
 
-renew_all_certificates() {
-  log INFO "Renewing all certificates..."
-  "$CERTBOT_PATH" renew --config-dir "$CONFIG_DIR" --work-dir "$WORK_DIR" --logs-dir "$LOGS_DIR" --quiet
-  "$APACHE_BIN" reload apache
-}
+ln -s "$INSTALL_DIR/ssl-manager.sh" /usr/local/bin/ssl-manager
 
-revoke_certificate() {
-  local domain=$1
-  validate_domain "$domain"
-  local cert_path="${CONFIG_DIR}/live/${domain}/cert.pem"
-  [ ! -f "$cert_path" ] && error_exit "No certificate found for $domain"
+echo -e "${GREEN}✓ Symlink created${NC}"
 
-  log INFO "Revoking certificate for $domain"
-  "$CERTBOT_PATH" revoke --cert-path "$cert_path" --config-dir "$CONFIG_DIR" --work-dir "$WORK_DIR" --logs-dir "$LOGS_DIR" --non-interactive
-  untrack_domain "$domain"
-  remove_apache_link "$domain"
-}
+# Configure sudo access
+echo -e "${BLUE}Configuring sudo access...${NC}"
 
-list_certificates() {
-  [ ! -f "$DOMAINS_FILE" ] && { echo "No domains tracked."; return; }
-  printf "%-30s %-25s %-10s\n" "DOMAIN" "EXPIRY" "DAYS LEFT"
-  while read -r domain; do
-    [ -z "$domain" ] && continue
-    local expiry=$(get_cert_expiry "$domain")
-    local days=$(days_until_expiry "$domain")
-    printf "%-30s %-25s %-10s\n" "$domain" "$expiry" "$days"
-  done < "$DOMAINS_FILE"
-}
+SUDOERS_FILE="/etc/sudoers.d/ssl-manager"
 
-# ============================================================================
-# Main Logic
-# ============================================================================
+cat > "$SUDOERS_FILE" <<EOF
+# Allow web user to run SSL Manager
+$WEB_USER ALL=(ALL) NOPASSWD: $INSTALL_DIR/ssl-manager.sh
+$WEB_USER ALL=(ALL) NOPASSWD: /usr/local/bin/ssl-manager
+EOF
 
-show_usage() {
-  echo "Usage: $(basename $0) [issue|renew-all|revoke|list] <domain>"
-  echo
-  echo "Examples:"
-  echo "  $(basename $0) issue example.com"
-  echo "  $(basename $0) renew-all"
-  echo "  $(basename $0) revoke example.com"
-  echo "  $(basename $0) list"
-}
+chmod 440 "$SUDOERS_FILE"
 
-main() {
-  [ $# -lt 1 ] && show_usage && exit 0
-  acquire_lock
-  trap cleanup EXIT
+# Validate sudoers file
+if visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Sudo access configured${NC}"
+else
+    echo -e "${RED}✗ Sudoers file validation failed${NC}"
+    rm "$SUDOERS_FILE"
+    exit 1
+fi
 
-  local cmd=$1
-  shift
-  local domain=$1
+# Check if certbot is installed
+echo -e "${BLUE}Checking dependencies...${NC}"
 
-  case "$cmd" in
-    issue)
-      [ -z "$domain" ] && error_exit "Domain required"
-      issue_certificate "$domain"
-      ;;
-    renew-all)
-      renew_all_certificates
-      ;;
-    revoke)
-      [ -z "$domain" ] && error_exit "Domain required"
-      revoke_certificate "$domain"
-      ;;
-    list)
-      list_certificates
-      ;;
-    *)
-      show_usage
-      ;;
-  esac
-}
+if ! command -v certbot &> /dev/null; then
+    echo -e "${YELLOW}Certbot not found. Installing...${NC}"
+    
+    if command -v apt-get &> /dev/null; then
+        apt-get update
+        apt-get install -y certbot
+    elif command -v yum &> /dev/null; then
+        yum install -y certbot
+    else
+        echo -e "${RED}Could not install certbot. Please install manually.${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✓ Certbot installed${NC}"
+else
+    echo -e "${GREEN}✓ Certbot found${NC}"
+fi
 
-main "$@"
+# Setup cron for auto-renewal
+echo -e "${BLUE}Setting up auto-renewal cron job...${NC}"
+
+CRON_FILE="/etc/cron.d/ssl-manager"
+
+cat > "$CRON_FILE" <<EOF
+# SSL Manager Auto-Renewal
+# Runs daily at 2:00 AM
+0 2 * * * root $INSTALL_DIR/ssl-manager.sh renew-all >> $INSTALL_DIR/logs/cron.log 2>&1
+EOF
+
+chmod 644 "$CRON_FILE"
+
+echo -e "${GREEN}✓ Cron job created${NC}"
+
+# Create test script
+echo -e "${BLUE}Creating test script...${NC}"
+
+cat > "$INSTALL_DIR/test.sh" <<'EOF'
+#!/bin/bash
+# SSL Manager Test Script
+
+echo "Testing SSL Manager installation..."
+echo ""
+
+# Test 1: Check if script exists
+if [ -f /usr/local/bin/ssl-manager ]; then
+    echo "✓ SSL Manager command found"
+else
+    echo "✗ SSL Manager command not found"
+    exit 1
+fi
+
+# Test 2: Check configuration
+if [ -f /opt/ssl-manager/config/settings.conf ]; then
+    echo "✓ Configuration file exists"
+else
+    echo "✗ Configuration file not found"
+    exit 1
+fi
+
+# Test 3: Check directories
+for dir in /opt/ssl-manager/{logs,certs,config} /bitnami/wordpress/wp-content/certbot/{config,work,logs}; do
+    if [ -d "$dir" ]; then
+        echo "✓ Directory exists: $dir"
+    else
+        echo "✗ Directory missing: $dir"
+        exit 1
+    fi
+done
+
+# Test 4: Test command execution
+echo ""
+echo "Running: ssl-manager --help"
+ssl-manager --help
+
+echo ""
+echo "All tests passed! SSL Manager is ready to use."
+echo ""
+echo "Try: ssl-manager test yourdomain.com"
+EOF
+
+chmod 755 "$INSTALL_DIR/test.sh"
+
+echo -e "${GREEN}✓ Test script created${NC}"
+
+# Installation complete
+echo ""
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN}  Installation Complete!${NC}"
+echo -e "${GREEN}============================================${NC}"
+echo ""
+echo -e "${BLUE}Quick Start:${NC}"
+echo ""
+echo "  Test installation:"
+echo "    $INSTALL_DIR/test.sh"
+echo ""
+echo "  Issue a certificate:"
+echo "    ssl-manager issue yourdomain.com"
+echo ""
+echo "  Test certificate (dry-run):"
+echo "    ssl-manager test yourdomain.com"
+echo ""
+echo "  List certificates:"
+echo "    ssl-manager list"
+echo ""
+echo "  View status:"
+echo "    ssl-manager status yourdomain.com"
+echo ""
+echo -e "${BLUE}Configuration:${NC}"
+echo "  Location: $INSTALL_DIR/config/settings.conf"
+echo "  Email: $LETSENCRYPT_EMAIL"
+echo ""
+echo -e "${BLUE}Logs:${NC}"
+echo "  Location: $INSTALL_DIR/logs/ssl-manager.log"
+echo ""
+echo -e "${BLUE}Auto-Renewal:${NC}"
+echo "  Cron job installed: Daily at 2:00 AM"
+echo "  Certificates will be renewed $RENEWAL_DAYS days before expiry"
+echo ""
+echo -e "${YELLOW}Important:${NC}"
+echo "  - Make sure your domain DNS points to this server"
+echo "  - Port 80 must be accessible for webroot validation"
+echo "  - Run 'ssl-manager test <domain>' before issuing real certificates"
+echo ""
