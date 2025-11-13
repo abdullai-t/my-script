@@ -53,6 +53,7 @@ cleanup() {
 acquire_lock() {
   if [ -f "$LOCK_FILE" ]; then
     local lock_pid=$(cat "$LOCK_FILE")
+    # Corrected syntax for 'if' statement execution
     if ps -p "$lock_pid" > /dev/null 2>&1; then
       error_exit "Another instance running (PID: $lock_pid)"
     fi
@@ -105,7 +106,7 @@ link_certificate_to_apache() {
   local domain=$1
   local conf_file="${APACHE_CONF_DIR}/${domain}-ssl.conf"
   local cert_path="${CONFIG_DIR}/live/${domain}"
-  local wp_root="/bitnami/wordpress" # Use the correct webroot path
+  local wp_root="/bitnami/wordpress" # Define correct webroot path
 
   log INFO "Linking certificate for $domain to Apache..."
 
@@ -118,15 +119,15 @@ link_certificate_to_apache() {
   SSLCertificateKeyFile "$cert_path/privkey.pem"
   SSLCertificateChainFile "$cert_path/chain.pem"
   
-  # === FIX for Certbot 404 (Multisite Configuration) ===
-  # Ensure ACME challenge requests bypass multisite routing rules
+  # === CRITICAL FIX for Certbot 404 (Multisite Configuration) ===
+  # This Alias ensures ACME challenge requests bypass WordPress/Multisite routing.
   Alias /.well-known/acme-challenge "$wp_root/.well-known/acme-challenge"
   <Directory "$wp_root/.well-known/acme-challenge">
     Options None
     AllowOverride None
     Require all granted
   </Directory>
-  # ==================================================
+  # =============================================================
   
   <Directory "$wp_root">
     AllowOverride All
@@ -166,7 +167,14 @@ issue_certificate() {
   create_directories
   log INFO "Issuing certificate for $domain"
 
-  "$CERTBOT_PATH" certonly --webroot -w "$WEBROOT" -d "$domain" \
+  # Check if a specific certbot binary path is required, otherwise use the configured CERTBOT_PATH
+  local certbot_cmd="$CERTBOT_PATH"
+  if [ ! -x "$CERTBOT_PATH" ] && [ -x "/opt/bitnami/letsencrypt/bin/certbot" ]; then
+    certbot_cmd="/opt/bitnami/letsencrypt/bin/certbot"
+  fi
+
+
+  "$certbot_cmd" certonly --webroot -w "$WEBROOT" -d "$domain" \
     --email "$LETSENCRYPT_EMAIL" --agree-tos --non-interactive \
     --config-dir "$CONFIG_DIR" --work-dir "$WORK_DIR" --logs-dir "$LOGS_DIR"
 
