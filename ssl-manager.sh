@@ -25,7 +25,7 @@ APACHE_CONF_DIR="/opt/bitnami/apache2/conf/vhosts"
 MAIN_SSL_CONF="/opt/bitnami/apache2/conf/bitnami/bitnami-ssl.conf"
 APACHE_BIN="/opt/bitnami/ctlscript.sh"
 LETSENCRYPT_EMAIL="admin@example.com"
-CHALLENGE_METHOD="webroot"
+CHALLENGE_METHOD="standalone"
 RENEWAL_DAYS=30
 
 # ============================================================================
