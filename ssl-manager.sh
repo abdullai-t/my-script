@@ -28,6 +28,8 @@ RENEWAL_DAYS=30
 DRY_RUN=false
 JSON_OUTPUT=false
 BACKUP_CERTS=true
+SKIP_DNS_CHECK=false
+SKIP_WEBROOT_CHECK=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -162,15 +164,72 @@ create_directories() {
     chmod -R 755 "${WEBROOT}/.well-known"
 }
 
+check_webroot_access() {
+    local domain=$1
+    
+    if [ "$SKIP_WEBROOT_CHECK" = true ]; then
+        log INFO "Skipping webroot access check (SKIP_WEBROOT_CHECK=true)"
+        return 0
+    fi
+    
+    log INFO "Testing webroot access for $domain..."
+    
+    # Create test file
+    local test_file="${WEBROOT}/.well-known/acme-challenge/test-$(date +%s).txt"
+    local test_content="certbot-test-$(date +%s)"
+    
+    echo "$test_content" > "$test_file" 2>/dev/null || {
+        log ERROR "Cannot write to ${WEBROOT}/.well-known/acme-challenge/"
+        return 1
+    }
+    
+    chmod 644 "$test_file"
+    
+    # Wait a moment for file to be ready
+    sleep 1
+    
+    # Test HTTP access
+    local response=$(curl -s --max-time 10 -L "http://${domain}/.well-known/acme-challenge/$(basename $test_file)" 2>/dev/null)
+    
+    # Cleanup
+    rm -f "$test_file"
+    
+    if [ "$response" = "$test_content" ]; then
+        log SUCCESS "Webroot access test passed"
+        return 0
+    else
+        log WARN "Webroot access test failed"
+        log WARN "Expected: $test_content"
+        log WARN "Got: $response"
+        log WARN "URL: http://${domain}/.well-known/acme-challenge/$(basename $test_file)"
+        log WARN "This may cause certificate issuance to fail"
+        return 1
+    fi
+}
+
 check_dns() {
     local domain=$1
+    
+    if [ "$SKIP_DNS_CHECK" = true ]; then
+        log INFO "Skipping DNS check (SKIP_DNS_CHECK=true)"
+        return 0
+    fi
+    
     log INFO "Checking DNS for $domain..."
     
-    local server_ip=$(curl -s ifconfig.me)
-    local dns_ip=$(dig +short "$domain" | tail -n1)
+    # Force IPv4 lookup
+    local server_ip=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null)
+    
+    if [ -z "$server_ip" ]; then
+        log WARN "Could not determine server IP address"
+        return 1
+    fi
+    
+    # Get A record (IPv4 only)
+    local dns_ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1)
     
     if [ -z "$dns_ip" ]; then
-        log WARN "DNS lookup failed for $domain"
+        log WARN "DNS lookup failed for $domain (no A record found)"
         return 1
     fi
     
@@ -179,7 +238,7 @@ check_dns() {
         return 1
     fi
     
-    log SUCCESS "DNS check passed for $domain"
+    log SUCCESS "DNS check passed for $domain (IP: $server_ip)"
     return 0
 }
 
@@ -187,11 +246,14 @@ check_port() {
     local port=$1
     log INFO "Checking if port $port is available..."
     
-    if netstat -tuln | grep -q ":${port} "; then
+    if netstat -tuln 2>/dev/null | grep -q ":${port} "; then
+        log SUCCESS "Port $port is open"
+        return 0
+    elif ss -tuln 2>/dev/null | grep -q ":${port} "; then
         log SUCCESS "Port $port is open"
         return 0
     else
-        log WARN "Port $port is not accessible"
+        log WARN "Port $port may not be accessible"
         return 1
     fi
 }
@@ -219,7 +281,7 @@ get_cert_expiry() {
     local cert_file="${CONFIG_DIR}/live/${domain}/cert.pem"
     
     if [ -f "$cert_file" ]; then
-        openssl x509 -enddate -noout -in "$cert_file" | cut -d= -f2
+        openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2
     else
         echo ""
     fi
@@ -234,7 +296,7 @@ days_until_expiry() {
         return
     fi
     
-    local expiry_epoch=$(date -d "$expiry" +%s)
+    local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
     local now_epoch=$(date +%s)
     local days=$(( ($expiry_epoch - $now_epoch) / 86400 ))
     echo "$days"
@@ -269,8 +331,9 @@ issue_certificate() {
     
     # Pre-flight checks
     if [ "$CHALLENGE_METHOD" = "webroot" ]; then
-        check_dns "$domain" || log WARN "DNS check failed, continuing anyway..."
-        check_port 80 || log WARN "Port 80 check failed, continuing anyway..."
+        check_webroot_access "$domain" || log WARN "Webroot access check failed, but continuing..."
+        check_dns "$domain" || log WARN "DNS check failed, but continuing..."
+        check_port 80 || log WARN "Port 80 check failed, but continuing..."
     fi
     
     # Build certbot command
@@ -586,13 +649,15 @@ Commands:
 Options:
   --json               Output in JSON format
   --dry-run            Perform dry-run (test mode)
+  --skip-dns           Skip DNS validation check
+  --skip-webroot       Skip webroot access check
   --help               Show this help message
 
 Examples:
   $(basename $0) issue example.com
   $(basename $0) renew example.com --json
+  $(basename $0) test example.com --skip-dns
   $(basename $0) list
-  $(basename $0) test example.com
 
 Configuration: $CONFIG_FILE
 Logs: $LOG_FILE
@@ -623,6 +688,14 @@ main() {
                 ;;
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --skip-dns)
+                SKIP_DNS_CHECK=true
+                shift
+                ;;
+            --skip-webroot)
+                SKIP_WEBROOT_CHECK=true
                 shift
                 ;;
             --help)
